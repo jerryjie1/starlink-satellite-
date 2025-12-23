@@ -1,0 +1,531 @@
+<!DOCTYPE html> /*HTML5 */
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Starlink 全球陸地即時監測 </title>
+<!--
+  ============================================================
+  - 目標：即時顯示 Starlink 衛星，並統計「目前位在全球陸地上空」的數量
+  - 你可以用 VS Code 的 Live Server 開啟，或用 python -m http.server 方式開啟
+  - 若遇到 Failed to fetch / CORS，多半是瀏覽器跨網域限制；程式內建多個代理來源可嘗試
+  ============================================================
+-->
+<style>
+/* ==========================
+   CSS 只負責「長相」：
+   - body / map：全螢幕地圖
+   - dashboard：右上角資訊卡（數字與狀態）
+   - satellite-icon / tooltip：衛星點點與提示框
+   你可以先不用懂 CSS，先把注意力放在下方的 JavaScript 邏輯。
+   ========================== */
+
+    body {
+        margin: 0;
+        padding: 0;
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        background: #0f172a;
+        color: rgb(30, 166, 41);
+        overflow: hidden;
+    }
+
+    #map {
+        width: 100vw;
+        height: 100vh;
+        z-index: 1;
+        background: #0f172a;
+    }
+
+    /* 儀表板樣式 */
+    #dashboard {
+        position: absolute;
+        top: 20px;
+        right: 20px;
+        width: 300px;
+        background: rgba(15, 23, 42, 0.85);
+        backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+        padding: 25px;
+        border-radius: 16px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        z-index: 1000;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    }
+
+    h1 {
+        font-size: 14px;
+        margin: 0 0 15px 0;
+        color: #94a3b8;
+        text-transform: uppercase;
+        letter-spacing: 1.5px;
+        font-weight: 600;
+    }
+
+    .counter-box {
+        text-align: center;
+        margin-bottom: 20px;
+    }
+
+    .count-number {
+        font-size: 72px;
+        font-weight: 700;
+        color: #38bdf8;
+        line-height: 1;
+        display: block;
+        text-shadow: 0 0 30px rgba(56, 189, 248, 0.6);
+        margin-bottom: 5px;
+    }
+
+    .count-label {
+        font-size: 15px;
+        color: #cbd5e1;
+        font-weight: 500;
+    }
+
+    .ratio-line{
+        margin-top: 6px;
+        font-size: 13px;
+        color: #cbd5e1;
+    }
+
+    #status {
+        font-size: 12px;
+        color: #64748b;
+        margin-top: 15px;
+        border-top: 1px solid rgba(255, 255, 255, 0.1);
+        padding-top: 15px;
+        line-height: 1.5;
+    }
+
+    .loading {
+        color: #fbbf24;
+        display: inline-block;
+        animation: pulse 1.5s infinite;
+    }
+
+    .error {
+        color: #ef4444;
+    }
+
+    @keyframes pulse {
+        0% {
+            opacity: 1;
+        }
+
+        50% {
+            opacity: 0.5;
+        }
+
+        100% {
+            opacity: 1;
+        }
+    }
+
+    .satellite-icon {
+        background-color: #38bdf8;
+        border-radius: 50%;
+        box-shadow: 0 0 8px #38bdf8, 0 0 20px rgba(56, 189, 248, 0.8);
+        border: 1px solid #ffffff;
+    }
+
+    .sat-tooltip {
+        background: rgba(15, 23, 42, 0.9);
+        border: 1px solid rgba(56, 189, 248, 0.3);
+        color: #38bdf8;
+        font-weight: bold;
+        font-size: 12px;
+        border-radius: 4px;
+        padding: 2px 6px;
+        box-shadow: none;
+    }
+
+    .leaflet-tooltip-top:before {
+        border-top-color: rgba(56, 189, 248, 0.3);
+    }
+
+</style>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+</head>
+
+<body>
+
+    <!-- 右上角資訊卡：顯示數字與狀態 -->
+    <div id="dashboard">
+        <h1>Starlink Monitor (Global Land)</h1>
+        <div class="counter-box">
+            <span id="sat-count" class="count-number">0</span>
+            <span class="count-label">位於全球陸地上空</span>
+            <div id="ratio" class="ratio-line">比率：--</div>
+        </div>
+        <div id="status"><span class="loading">系統初始化中...</span></div>
+    </div>
+
+    <!-- 地圖本體 -->
+    <div id="map"></div>
+
+    <!-- 外部函式庫（CDN） -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/satellite.js/5.0.0/satellite.min.js"></script>
+    <script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/topojson-client@3/dist/topojson-client.min.js"></script>
+
+<script>
+/**********************************************************************
+ * Starlink 全球陸地即時監測（全註解版）
+ *
+ * 你要先記住的「整體流程」只有 4 步：
+ * (1) 建立地圖（Leaflet）
+ * (2) 下載「全球陸地邊界」資料（TopoJSON -> GeoJSON）
+ * (3) 下載 Starlink 的 TLE 軌道資料，並轉成 satrec（satellite.js）
+ * (4) 反覆計算每顆衛星「此刻」的位置 → 判斷是否在陸地上空 → 更新畫面
+ *
+ * 用到的外部工具（你可以把它想成「已經做好的積木」）：
+ * - Leaflet：畫地圖、放 marker
+ * - satellite.js：把 TLE 變成「可以算位置」的物件，並依時間推算位置（SGP4）
+ * - Turf.js：做「點是否在多邊形內」(Point-in-Polygon)
+ * - topojson-client：把 TopoJSON 轉成 GeoJSON（因為 world-atlas 提供 TopoJSON）
+ **********************************************************************/
+
+// ============================================================
+// 0) 你最常改的設定（先看這裡）
+// ============================================================
+
+// 每幾毫秒更新一次衛星位置（1500ms = 1.5 秒）
+const UPDATE_INTERVAL_MS = 1500;
+
+// 為了不卡：最多只「畫出」多少顆衛星點
+// 注意：統計 insideCount 仍然是全部衛星都算，只是畫面只畫前 N 顆
+const MAX_MARKERS_TO_DRAW = 2600;
+
+// 全球陸地邊界（Natural Earth / world-atlas 的 land-110m，檔案小、載入快）
+// 想更細緻海岸線可以改成 land-50m，但更吃效能
+const LAND_TOPO_URL = "https://cdn.jsdelivr.net/npm/world-atlas@2/land-110m.json";
+
+// Starlink 的 TLE 來源（CelesTrak）
+const TLE_URL_RAW = "https://celestrak.org/NORAD/elements/gp.php?GROUP=starlink&FORMAT=tle";
+
+// ✅ 瀏覽器會有「同源政策」：網頁不能隨便抓別的網域資料 → 會出現 CORS
+// 所以我們準備「候選網址」：直接抓 + 兩個常見 CORS 代理
+// 代理偶爾會失效或被學校網路擋，所以用「輪流嘗試」最穩。
+const TLE_URL_CANDIDATES = [
+    TLE_URL_RAW,
+    "https://api.allorigins.win/raw?url=" + encodeURIComponent(TLE_URL_RAW),
+    "https://corsproxy.io/?url=" + encodeURIComponent(TLE_URL_RAW),
+];
+
+// 開啟後會在 Console 印更多訊息（F12 → Console）
+const DEBUG_LOG = false;
+
+// ============================================================
+// 1) 取得畫面元素（Dashboard）
+// ============================================================
+const statusEl = document.getElementById("status");
+const countEl = document.getElementById("sat-count");
+const ratioEl = document.getElementById('ratio');
+// ============================================================
+// 2) Leaflet：建立地圖（你可以把它當成「底圖畫布」）
+// ============================================================
+const map = L.map("map", {
+    worldCopyJump: true,  // 讓地圖跨過 ±180° 時比較順
+    preferCanvas: true,   // 讓大量點的渲染更順一點（看瀏覽器與電腦）
+}).setView([24, 120], 8);   // 初始視角：緯度 24、經度 120、縮放 8 (台灣附近)
+
+// 底圖：OpenStreetMap（只是背景圖，不影響計算）
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 18,
+    attribution: "&copy; OpenStreetMap contributors",
+}).addTo(map);
+
+// 建立一個 pane，確保衛星點點畫在比較上層
+map.createPane("satellitesPane");
+map.getPane("satellitesPane").style.zIndex = 650;
+
+// 這個 layerGroup 會放所有衛星 marker
+// 每次更新時我們會 markersGroup.clearLayers() 先清掉舊點，再畫新點
+const markersGroup = L.layerGroup().addTo(map);
+
+// ============================================================
+// 3) 全域資料容器（程式會把資料塞進這些變數）
+// ============================================================
+
+// 3-1) 全球陸地多邊形（Turf 用的 polygon features）
+let landPolygons = [];
+
+// 3-2) 每個 polygon 的 bbox（Bounding Box）
+// bbox 形式：[minLng, minLat, maxLng, maxLat]
+// 作用：先用 bbox 快速篩掉大多數不可能命中的 polygon，省下 Point-in-Polygon 的時間
+let landBBoxes = [];
+
+// 3-3) 畫在地圖上的陸地邊界圖層（只是視覺用）
+let landGeoLayer;
+
+// 3-4) Starlink 衛星陣列：每一顆包含 name 與 satrec（satellite.js 的物件）
+let satellites = [];
+
+// 3-5) 計時器：避免重複 setInterval 造成越跑越快
+let updateTimer = null;
+
+// ============================================================
+// 4) 下載並初始化「全球陸地邊界」
+// ============================================================
+async function loadGlobalLand() {
+    try {
+        statusEl.innerHTML = `<span class="loading">正在載入全球陸地邊界...</span>`;
+
+        // fetch = 用瀏覽器下載資料；await = 等它下載完成再往下做
+        const resp = await fetch(LAND_TOPO_URL, { cache: "no-store" });
+        if (!resp.ok) throw new Error(`陸地資料下載失敗 (HTTP ${resp.status})`);
+
+        const topo = await resp.json();
+
+        // world-atlas 的 land 是 TopoJSON，需轉成 GeoJSON
+        // topo.objects.land 是資料內的「陸地物件」
+        const landGeo = topojson.feature(topo, topo.objects.land);
+
+        // Turf flatten：把 MultiPolygon 拆成很多 Polygon
+        // 這樣 booleanPointInPolygon 的處理更單純，也更容易做 bbox 加速
+        const flattened = turf.flatten(landGeo);
+        landPolygons = flattened.features;
+
+        // 預先算好 bbox，之後每顆衛星檢查時先比 bbox
+        landBBoxes = landPolygons.map(f => turf.bbox(f));
+
+        // 視覺化：畫出陸地邊界（淡淡的，不干擾看衛星）
+        if (landGeoLayer) landGeoLayer.remove();
+        landGeoLayer = L.geoJSON(landGeo, {
+            style: {
+                color: "#38bdf8",
+                weight: 1.0,
+                opacity: 0.25,
+                fillColor: "#38bdf8",
+                fillOpacity: 0.04,
+            },
+            interactive: false, // 不要讓它擋住點擊
+        }).addTo(map);
+
+        statusEl.innerHTML = `<span class="loading">陸地邊界載入完成，準備下載衛星軌道資料...</span>`;
+        if (DEBUG_LOG) console.log("Land polygons:", landPolygons.length);
+
+        return true;
+    } catch (err) {
+        console.error("loadGlobalLand error:", err);
+        statusEl.innerHTML = `<span class="error">陸地邊界載入失敗：${err.message}</span>`;
+        return false;
+    }
+}
+
+// ============================================================
+// 5) 下載 TLE（會自動輪流嘗試多個來源）
+// ============================================================
+
+// 小工具：依序嘗試 urls，第一個成功就回傳文字
+async function fetchTextWithFallback(urls) {
+    let lastErr = null;
+
+    for (const url of urls) {
+        try {
+            if (DEBUG_LOG) console.log("Try fetch:", url);
+
+            const resp = await fetch(url, { cache: "no-store" });
+
+            // HTTP 不是 200~299，就當失敗
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+            const text = await resp.text();
+
+            // 做一個「非常簡單」的有效性檢查：
+            // TLE 格式通常會包含很多行，且 line1 以 "1 " 開頭、line2 以 "2 " 開頭
+            const lines = text.trim().split("\n");
+            const hasTleShape = lines.length >= 3 && lines.some(l => l.startsWith("1 ")) && lines.some(l => l.startsWith("2 "));
+            if (!hasTleShape) throw new Error("內容不像 TLE（可能代理回傳了錯誤頁面）");
+
+            return text;
+        } catch (err) {
+            lastErr = err;
+            if (DEBUG_LOG) console.warn("Fetch failed:", url, err);
+        }
+    }
+
+    // 全部都失敗：把最後一個錯誤丟出去，讓外層顯示
+    throw lastErr ?? new Error("未知錯誤");
+}
+
+// 解析 TLE 文字 → satellites[]
+function parseTLE(tleText) {
+    // TLE 通常是三行一組：
+    // 第 1 行：衛星名稱（可有可無，但 CelesTrak 會給）
+    // 第 2 行：以 "1 " 開頭
+    // 第 3 行：以 "2 " 開頭
+    const lines = tleText
+        .split("\n")
+        .map(s => s.trim())
+        .filter(Boolean);
+
+    const result = [];
+
+    // i 每次跳 3 行
+    for (let i = 0; i + 2 < lines.length; i += 3) {
+        const name = lines[i];
+        const line1 = lines[i + 1];
+        const line2 = lines[i + 2];
+
+        // 容錯：如果格式不對，就跳過
+        if (!line1.startsWith("1 ") || !line2.startsWith("2 ")) continue;
+
+        // twoline2satrec：把 TLE 轉成 satrec（之後 propagate 才能算位置）
+        const satrec = satellite.twoline2satrec(line1, line2);
+        result.push({ name, satrec });
+    }
+
+    return result;
+}
+
+async function fetchTLEAndStart() {
+    try {
+        statusEl.innerHTML = `<span class="loading">正在下載 Starlink TLE 軌道資料...</span>`;
+
+        const tleText = await fetchTextWithFallback(TLE_URL_CANDIDATES);
+        satellites = parseTLE(tleText);
+
+        if (!satellites.length) throw new Error("解析不到任何衛星（TLE 格式可能異常）");
+
+        statusEl.innerText = `已追蹤 ${satellites.length} 顆衛星。系統運作中。`;
+
+        // 啟動更新循環（避免重複 setInterval）
+        if (updateTimer) clearInterval(updateTimer);
+        updateSatellites(); // 先更新一次，讓畫面立刻有東西
+        updateTimer = setInterval(updateSatellites, UPDATE_INTERVAL_MS);
+
+    } catch (err) {
+        console.error("fetchTLEAndStart error:", err);
+        statusEl.innerHTML = `<span class="error">下載失敗：${err.message}<br>可能原因：CORS、代理被擋、網路限制。<br>可嘗試：換網路/換代理/用本機 Python 代理。</span>`;
+    }
+}
+
+// ============================================================
+// 6) 核心判斷：一個經緯度點是否「落在陸地多邊形裡」
+// ============================================================
+function isOverLand(lng, lat) {
+    // GeoJSON / Turf 的座標順序是 [經度, 緯度] = [lon, lat]
+    const pt = [lng, lat];
+
+    // 先 bbox 篩一輪（快），再做 Point-in-Polygon（準）
+    for (let i = 0; i < landPolygons.length; i++) {
+        const bb = landBBoxes[i]; // [minLng, minLat, maxLng, maxLat]
+        if (lng < bb[0] || lng > bb[2] || lat < bb[1] || lat > bb[3]) continue;
+
+        if (turf.booleanPointInPolygon(pt, landPolygons[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ============================================================
+// 7) 核心更新：計算每顆衛星此刻位置、統計並更新畫面
+// ============================================================
+function updateSatellites() {
+    const now = new Date();
+
+    // 清掉上一輪畫的點
+    markersGroup.clearLayers();
+
+    let insideCount = 0;   // 「在陸地上空」的衛星數（統計用）
+    let drawnCount = 0;    // 實際畫到地圖上的點數（效能用）
+
+    // 小藍點（CSS class: satellite-icon）
+    const icon = L.divIcon({
+        className: "satellite-icon",
+        iconSize: [6, 6],
+        iconAnchor: [3, 3],
+    });
+
+    // 逐顆計算
+    for (const sat of satellites) {
+        // satellite.propagate：用 SGP4 推算「now 這個時間點」的衛星位置（ECI 座標）
+        const pv = satellite.propagate(sat.satrec, now);
+        if (!pv.position) continue;
+
+        // gmst：格林威治恒星時，用於把 ECI 轉到地球座標系
+        const gmst = satellite.gstime(now);
+
+        // 轉成經緯度（弧度）
+        const gd = satellite.eciToGeodetic(pv.position, gmst);
+
+        // 弧度 -> 度數
+        const lat = satellite.degreesLat(gd.latitude);
+        const lng = satellite.degreesLong(gd.longitude);
+
+        // 判斷是否在陸地上空
+        if (isOverLand(lng, lat)) {
+            insideCount++;
+
+            // 限制最多畫幾顆（避免卡）
+            if (drawnCount < MAX_MARKERS_TO_DRAW) {
+                drawnCount++;
+
+                // 建立 marker 並加到地圖
+                const marker = L.marker([lat, lng], {
+                    icon,
+                    pane: "satellitesPane",
+                    interactive: true,
+                });
+
+                // 滑過提示（tooltip）
+                marker.bindTooltip(`${sat.name}`, {
+                    permanent: false,
+                    direction: "top",
+                    offset: [0, -3],
+                    className: "sat-tooltip",
+                });
+
+                // 點擊彈窗（popup）
+                marker.bindPopup(
+                    `<div style="text-align:center;">
+                        <b>${sat.name}</b><br>
+                        <small>Lat: ${lat.toFixed(4)}<br>Lon: ${lng.toFixed(4)}</small>
+                     </div>`
+                );
+
+                marker.addTo(markersGroup);
+            }
+        }
+    }
+
+    // 更新右上角數字
+    countEl.innerText = insideCount;
+
+    // 更新狀態列（顯示時間與繪製數量）
+    countEl.innerText = insideCount;
+
+    // ✅ 比率 = 在陸地上空 / 總衛星數
+    const totalCount = satellites.length;
+    const ratio = totalCount ? insideCount / totalCount : 0;
+
+    // 更新右上角框框內的比率文字（避免 ratioEl 不存在時報錯）
+    if (ratioEl) {
+        ratioEl.innerText = `比率：${insideCount}/${totalCount} = ${(ratio * 100).toFixed(2)}%`;
+    }
+
+statusEl.innerText = `最後更新: ${now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`;
+
+}
+
+// ============================================================
+// 8) 程式入口：依序執行「載入陸地」→「下載 TLE」→「開始更新」
+// ============================================================
+(async function main() {
+    statusEl.innerHTML = `<span class="loading">系統初始化中...</span>`;
+
+    const ok = await loadGlobalLand();
+    if (!ok) return;
+
+    await fetchTLEAndStart();
+})();
+
+</script>
+
+</body>
+</html>
